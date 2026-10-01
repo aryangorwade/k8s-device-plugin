@@ -17,6 +17,7 @@
 package rm
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"strconv"
@@ -38,6 +39,8 @@ const (
 	// Note that this also allows individual XIDs to be selected when ALL XIDs
 	// are disabled.
 	envEnableHealthChecks = "DP_ENABLE_HEALTHCHECKS"
+
+	xidGPURecoveryActionChanged = 154
 )
 
 type placedDevice struct {
@@ -177,8 +180,14 @@ func (r *nvmlResourceManager) checkHealth(stop <-chan any, devices Devices, unhe
 			continue
 		}
 
+		if e.EventData == xidGPURecoveryActionChanged && !gpuRequiresRecovery(e.Device, eventUUID) {
+			continue
+		}
+
 		for _, d := range ds {
-			if d.IsMigDevice() {
+			// Recovery actions apply to the entire GPU, including all its MIG
+			// instances, even if the event identifies a particular instance.
+			if d.IsMigDevice() && e.EventData != xidGPURecoveryActionChanged {
 				gi := deviceIDToGiMap[d.ID]
 				ci := deviceIDToCiMap[d.ID]
 				if !matchesMigEvent(gi, ci, e.GpuInstanceId, e.ComputeInstanceId) {
@@ -191,6 +200,56 @@ func (r *nvmlResourceManager) checkHealth(stop <-chan any, devices Devices, unhe
 			unhealthy <- d
 		}
 	}
+}
+
+// gpuRequiresRecovery treats an unavailable or unrecognized recovery action
+// conservatively, preserving the unhealthy behavior of older drivers.
+func gpuRequiresRecovery(device nvml.Device, uuid string) bool {
+	fields := []nvml.FieldValue{{FieldId: nvml.FI_DEV_GET_GPU_RECOVERY_ACTION}}
+	if ret := device.GetFieldValues(fields); ret != nvml.SUCCESS {
+		klog.Warningf("Xid 154 on device %s: failed to query GPU recovery action: %v; marking device as unhealthy", uuid, ret)
+		return true
+	}
+	field := fields[0]
+	if field.NvmlReturn != uint32(nvml.SUCCESS) {
+		klog.Warningf("Xid 154 on device %s: GPU recovery action field failed: %v; marking device as unhealthy", uuid, field.NvmlReturn)
+		return true
+	}
+	if field.ValueType != uint32(nvml.VALUE_TYPE_UNSIGNED_INT) {
+		klog.Warningf("Xid 154 on device %s: unexpected GPU recovery action value type %v; marking device as unhealthy", uuid, field.ValueType)
+		return true
+	}
+
+	// NVML stores uiVal in a native-endian C union. The remaining bytes of
+	// the union are not part of the value and may be uninitialized.
+	action := binary.NativeEndian.Uint32(field.Value[:4])
+	var name string
+	switch action {
+	case uint32(nvml.GPU_RECOVERY_ACTION_NONE):
+		klog.Infof("Xid 154 on device %s: no GPU recovery action required; ignoring event", uuid)
+		return false
+	case uint32(nvml.GPU_RECOVERY_ACTION_GPU_RESET):
+		name = "GPU reset"
+	case uint32(nvml.GPU_RECOVERY_ACTION_NODE_REBOOT):
+		name = "node reboot"
+	case uint32(nvml.GPU_RECOVERY_ACTION_DRAIN_P2P):
+		name = "drain P2P"
+	case uint32(nvml.GPU_RECOVERY_ACTION_DRAIN_AND_RESET):
+		name = "drain and reset"
+	case uint32(nvml.GPU_RECOVERY_ACTION_RECOVER_IMEX_DOMAIN):
+		name = "recover IMEX domain"
+	case uint32(nvml.GPU_RECOVERY_ACTION_BUS_RESET):
+		name = "bus reset"
+	case uint32(nvml.GPU_RECOVERY_ACTION_SYSTEM_REBOOT):
+		name = "system reboot"
+	default:
+		klog.Warningf("Xid 154 on device %s: unknown GPU recovery action %d; marking device as unhealthy", uuid, action)
+		return true
+	}
+	// The device plugin prevents new allocations. Recovery itself must be
+	// coordinated externally with the workloads using the GPU or node.
+	klog.Warningf("Xid 154 on device %s: GPU recovery action required: %s (%d); marking device as unhealthy", uuid, name, action)
+	return true
 }
 
 const allXIDs = 0
