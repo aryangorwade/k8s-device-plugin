@@ -291,6 +291,9 @@ func continuouslySyncConfigChanges(clientset *kubernetes.Clientset, config *Sync
 
 	stop := make(chan struct{})
 	go controller.Run(stop)
+	// Until the informer has delivered the node, the first Get() would return
+	// an empty label even when the node has one.
+	cache.WaitForCacheSync(stop, controller.HasSynced)
 	return stop
 }
 
