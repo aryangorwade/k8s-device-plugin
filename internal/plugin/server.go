@@ -25,6 +25,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
@@ -63,6 +64,8 @@ type nvidiaDevicePlugin struct {
 	server *grpc.Server
 	health chan rm.HealthEvent
 	stop   chan any
+
+	healthReady chan any
 
 	imexChannels imex.Channels
 
@@ -110,6 +113,7 @@ func (plugin *nvidiaDevicePlugin) initialize() {
 	plugin.server = grpc.NewServer([]grpc.ServerOption{}...)
 	plugin.health = make(chan rm.HealthEvent)
 	plugin.stop = make(chan any)
+	plugin.healthReady = make(chan any)
 }
 
 func (plugin *nvidiaDevicePlugin) cleanup() {
@@ -148,9 +152,13 @@ func (plugin *nvidiaDevicePlugin) Start(kubeletSocket string) error {
 	}
 	klog.Infof("Registered device plugin for '%s' with Kubelet", plugin.rm.Resource())
 
+	healthReady := plugin.healthReady
+	markHealthReady := sync.OnceFunc(func() { close(healthReady) })
 	go func() {
 		// TODO: add MPS health check
-		err := plugin.rm.CheckHealth(plugin.stop, plugin.health)
+		err := plugin.rm.CheckHealth(plugin.stop, plugin.health, markHealthReady)
+		// A health check that returns early must not block the first ListAndWatch response.
+		markHealthReady()
 		if err != nil {
 			klog.Errorf("Failed to start health check: %v; continuing with health checks disabled", err)
 		}
@@ -265,6 +273,17 @@ func (plugin *nvidiaDevicePlugin) GetDevicePluginOptions(context.Context, *plugi
 
 // ListAndWatch lists devices and update that list according to the health status
 func (plugin *nvidiaDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin_ListAndWatchServer) error {
+	// Apply the initial device health before the first list, so that a GPU that needs recovery is not advertised as healthy.
+	for healthReady := plugin.healthReady; healthReady != nil; {
+		select {
+		case <-plugin.stop:
+			return nil
+		case <-healthReady:
+			healthReady = nil
+		case event := <-plugin.health:
+			event.Device.Health = event.Health
+		}
+	}
 	if err := s.Send(&pluginapi.ListAndWatchResponse{Devices: plugin.apiDevices()}); err != nil {
 		return err
 	}

@@ -22,6 +22,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"k8s.io/klog/v2"
@@ -63,7 +64,8 @@ func matchesMigEvent(deviceGI, deviceCI, eventGI, eventCI uint32) bool {
 
 // CheckHealth performs health checks on a set of devices, writing to the 'health' channel whenever a device's health changes.
 // GPUs that support GPU recovery actions are checked using recovery action events, with Xid events as the fallback.
-func (r *nvmlResourceManager) checkHealth(stop <-chan any, devices Devices, health chan<- HealthEvent) error {
+// It calls ready after it sends the initial health of the devices.
+func (r *nvmlResourceManager) checkHealth(stop <-chan any, devices Devices, health chan<- HealthEvent, ready func()) error {
 	xids := getDisabledHealthCheckXids()
 	if xids.IsAllDisabled() {
 		return nil
@@ -139,6 +141,11 @@ func (r *nvmlResourceManager) checkHealth(stop <-chan any, devices Devices, heal
 		}
 
 		ret = gpu.RegisterEvents(eventMask&supportedEvents, eventSet)
+		if supportsRecoveryAction && ret != nvml.SUCCESS {
+			klog.Warningf("Unable to register GPU recovery action events for %v: %v; falling back to Xid health checks.", parentUUID, ret)
+			supportsRecoveryAction = false
+			ret = gpu.RegisterEvents(xidEventMask&supportedEvents, eventSet)
+		}
 		switch {
 		case ret == nvml.ERROR_NOT_SUPPORTED:
 			klog.Warningf("Device %v is too old to support healthchecking.", parentUUID)
@@ -152,6 +159,7 @@ func (r *nvmlResourceManager) checkHealth(stop <-chan any, devices Devices, heal
 			sendGpuRecoveryActionHealth(gpu, parentUUID, subdevices, health)
 		}
 	}
+	ready()
 
 	for {
 		select {
@@ -237,9 +245,20 @@ func supportsGpuRecoveryAction(gpu nvml.Device, uuid string, supportedEvents uin
 	return true
 }
 
+// GPU recovery action reads are retried to tolerate temporary NVML failures.
+const (
+	gpuRecoveryActionReadAttempts      = 3
+	gpuRecoveryActionReadRetryInterval = time.Second
+)
+
 // sendGpuRecoveryActionHealth sets GPU health according to the current recovery actions api value.
 func sendGpuRecoveryActionHealth(gpu nvml.Device, uuid string, devices []*Device, health chan<- HealthEvent) {
 	action, err := getGpuRecoveryAction(gpu)
+	for attempt := 1; err != nil && attempt < gpuRecoveryActionReadAttempts; attempt++ {
+		klog.Infof("Failed to read the GPU recovery action for %v: %v; retrying.", uuid, err)
+		time.Sleep(gpuRecoveryActionReadRetryInterval)
+		action, err = getGpuRecoveryAction(gpu)
+	}
 	if err != nil {
 		klog.Infof("Failed to read the GPU recovery action for %v: %v; marking its devices as unhealthy.", uuid, err)
 		for _, d := range devices {

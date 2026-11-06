@@ -19,7 +19,7 @@ var _ ResourceManager = &ResourceManagerMock{}
 //
 //		// make and configure a mocked ResourceManager
 //		mockedResourceManager := &ResourceManagerMock{
-//			CheckHealthFunc: func(stop <-chan any, health chan<- HealthEvent) error {
+//			CheckHealthFunc: func(stop <-chan any, health chan<- HealthEvent, ready func()) error {
 //				panic("mock out the CheckHealth method")
 //			},
 //			DevicesFunc: func() Devices {
@@ -45,7 +45,7 @@ var _ ResourceManager = &ResourceManagerMock{}
 //	}
 type ResourceManagerMock struct {
 	// CheckHealthFunc mocks the CheckHealth method.
-	CheckHealthFunc func(stop <-chan any, health chan<- HealthEvent) error
+	CheckHealthFunc func(stop <-chan any, health chan<- HealthEvent, ready func()) error
 
 	// DevicesFunc mocks the Devices method.
 	DevicesFunc func() Devices
@@ -70,6 +70,8 @@ type ResourceManagerMock struct {
 			Stop <-chan any
 			// Health is the health argument value.
 			Health chan<- HealthEvent
+			// Ready is the ready argument value.
+			Ready func()
 		}
 		// Devices holds details about calls to the Devices method.
 		Devices []struct {
@@ -106,13 +108,15 @@ type ResourceManagerMock struct {
 }
 
 // CheckHealth calls CheckHealthFunc.
-func (mock *ResourceManagerMock) CheckHealth(stop <-chan any, health chan<- HealthEvent) error {
+func (mock *ResourceManagerMock) CheckHealth(stop <-chan any, health chan<- HealthEvent, ready func()) error {
 	callInfo := struct {
 		Stop   <-chan any
 		Health chan<- HealthEvent
+		Ready  func()
 	}{
 		Stop:   stop,
 		Health: health,
+		Ready:  ready,
 	}
 	mock.lockCheckHealth.Lock()
 	mock.calls.CheckHealth = append(mock.calls.CheckHealth, callInfo)
@@ -123,7 +127,7 @@ func (mock *ResourceManagerMock) CheckHealth(stop <-chan any, health chan<- Heal
 		)
 		return errOut
 	}
-	return mock.CheckHealthFunc(stop, health)
+	return mock.CheckHealthFunc(stop, health, ready)
 }
 
 // CheckHealthCalls gets all the calls that were made to CheckHealth.
@@ -133,10 +137,12 @@ func (mock *ResourceManagerMock) CheckHealth(stop <-chan any, health chan<- Heal
 func (mock *ResourceManagerMock) CheckHealthCalls() []struct {
 	Stop   <-chan any
 	Health chan<- HealthEvent
+	Ready  func()
 } {
 	var calls []struct {
 		Stop   <-chan any
 		Health chan<- HealthEvent
+		Ready  func()
 	}
 	mock.lockCheckHealth.RLock()
 	calls = mock.calls.CheckHealth

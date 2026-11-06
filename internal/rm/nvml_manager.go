@@ -103,8 +103,9 @@ func (r *nvmlResourceManager) GetDevicePaths(ids []string) []string {
 }
 
 // CheckHealth performs health checks on a set of devices, writing to the 'health' channel whenever a device's health changes
-func (r *nvmlResourceManager) CheckHealth(stop <-chan any, health chan<- HealthEvent) error {
-	return r.checkHealth(stop, r.devices, health)
+// It calls ready after it sends the initial health of the devices.
+func (r *nvmlResourceManager) CheckHealth(stop <-chan any, health chan<- HealthEvent, ready func()) error {
+	return r.checkHealth(stop, r.devices, health, ready)
 }
 
 // getPreferredAllocation runs an allocation algorithm over the inputs.
